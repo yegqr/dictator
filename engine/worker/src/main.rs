@@ -10,8 +10,9 @@
 //!
 //! loads DIR/<pack>.tzf for each listed pack and DIR/silero_vad.onnx, prints `{"ready": true, "load_s": ...}` (or
 //! `{"error": ...}` and exits 1), then per request reads one JSON line `{"n": BYTES, "lang": "pieces", "langs":
-//! [codes, main first], "gate_db": float}` followed by BYTES (even, 0 < BYTES <= MAX_BYTES) of raw 16 kHz mono s16
-//! audio (one piece of a recording, see Streamer in helper/dictate), and answers one JSON line
+//! [codes, main first], "gate_db": float, "ctx": CTX}` followed by BYTES (even, 0 < BYTES <= MAX_BYTES) of raw 16 kHz
+//! mono s16 audio (one piece of a recording, see Streamer in helper/dictate; its first CTX bytes, optional, even and
+//! less than BYTES, are the recording just before the piece: heard as context, not written), and answers one JSON line
 //! `{"cands": {code: [text, score]}, "main": code, "note", "asr_s"}`: one candidate per enabled language that a loaded
 //! pack has, the main one (the first of them) first; the helper picks the language once, over all pieces of the
 //! recording. score: `cand_score`. Ends (exit 0) at the end of its input.
@@ -542,12 +543,13 @@ fn loaded(packs: &[Pack]) -> Vec<(&str, &[Lang])> {
     packs.iter().map(|p| (p.name, p.m.langs())).collect()
 }
 
-/// Each of `langs` (a loaded pack has them all) read by its pack, in the order of `langs`.
-fn read(packs: &[Pack], audio: &[f32], langs: &[Lang]) -> Vec<Cand> {
-    let dur = audio.len() as f64 / SR as f64; // n / 2 / 16000: the gate keeps the length
+/// Each of `langs` (a loaded pack has them all) read by its pack, in the order of `langs`; the first `ctx` samples
+/// of `audio` are context only.
+fn read(packs: &[Pack], audio: &[f32], ctx: usize, langs: &[Lang]) -> Vec<Cand> {
+    let dur = (audio.len() - ctx) as f64 / SR as f64; // of the piece (the gate keeps the length)
     let mut out: Vec<Cand> = Vec::new();
     for (p, ls) in groups(langs, &loaded(packs)) {
-        for c in Transcription::candidates(&packs[p].m, audio, &ls, BEAM) {
+        for c in Transcription::candidates_after(&packs[p].m, audio, ctx, &ls, BEAM) {
             out.push(Cand {
                 lang: c.lang,
                 text: c.text.trim().to_string(),
@@ -579,9 +581,25 @@ fn answer(packs: &[Pack], req: &J, raw: &[u8]) -> String {
         .chunks_exact(2)
         .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
         .collect();
+    let ctx = match context(req, raw.len()) {
+        Ok(c) => c,
+        Err(e) => return error(&e),
+    };
     let muted = gate(&mut audio, job.gate_db);
-    let cands = read(packs, &audio, &job.langs);
+    let cands = read(packs, &audio, ctx, &job.langs);
     reply(&cands, muted, t0.elapsed().as_secs_f64())
+}
+
+/// The samples of left context at the start of a request's audio of `n` bytes: "ctx" bytes, a whole even number
+/// below n (absent, null or 0: none).
+fn context(req: &J, n: usize) -> Result<usize, String> {
+    match req.get("ctx") {
+        None | Some(J::Null) => Ok(0),
+        Some(J::Num(x)) if x.fract() == 0.0 && *x >= 0.0 && *x < n as f64 && *x as usize % 2 == 0 => {
+            Ok(*x as usize / 2)
+        }
+        Some(_) => Err("ValueError: ctx".into()),
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ process
@@ -905,6 +923,18 @@ mod tests {
             assert!(job(&obj(&bad), &two).is_err(), "{bad}");
         }
         assert!(job(&obj(r#"{"lang": "pieces", "langs": ["fa"]}"#), &all()).is_ok());
+    }
+
+    #[test]
+    fn context_is_a_whole_even_number_below_the_size() {
+        let ctx = |v: &str| context(&obj(&format!(r#"{{"lang": "pieces", "ctx": {v}}}"#)), 100);
+        assert_eq!(context(&obj(r#"{"lang": "pieces"}"#), 100), Ok(0));
+        assert_eq!(ctx("null"), Ok(0));
+        assert_eq!(ctx("0"), Ok(0));
+        assert_eq!(ctx("98"), Ok(49));
+        for bad in ["100", "102", "-2", "3", "2.5", "1e300", "\"8\"", "true", "[8]", "{}"] {
+            assert!(ctx(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

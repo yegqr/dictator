@@ -148,12 +148,25 @@ impl<'m> Transcription<'m> {
     /// compare the candidates' scores; `Score::path_per_second` with beam > 1 compares best across models).
     /// Costs one transcription per language.
     pub fn candidates(m: &'m Models, audio: &[f32], langs: &[Lang], beam: usize) -> Vec<Candidate> {
+        Transcription::candidates_after(m, audio, 0, langs, beam)
+    }
+
+    /// As [`Transcription::candidates`], for a piece of a longer recording: the first `context` samples of `audio`
+    /// are the recording just before the piece, heard but not written (words from the piece on; times still count
+    /// from the start of `audio`). Without it the model starts cold in the middle of speech and can skip the piece's
+    /// first words, often a whole sentence; the voice detector also starts cold and can miss quiet words there. As
+    /// for a piece of [`Transcription::new`], the context used is the last 1.2 s of speech before the piece (within
+    /// 6 s).
+    pub fn candidates_after(m: &'m Models, audio: &[f32], context: usize, langs: &[Lang], beam: usize) -> Vec<Candidate> {
         let own: Vec<Lang> = m.langs().iter().copied().filter(|l| langs.contains(l)).collect();
         let Some(&first) = own.first() else { return Vec::new() };
         let base = Transcription::with_eou(m, audio, &[first], beam, false);
+        let open0 = (context / FR as usize).min(base.vf.len());
+        let ctx = context_frames(&base.vf, open0);
+        let last_end = (open0 as i64 * FR) as f64 / SR as f64;
         own.into_iter()
             .map(|lang| {
-                let mut t = Transcription { audio: base.audio.clone(), vf: base.vf.clone(), lang, langs: alloc::vec![lang], ..Transcription::empty(m, beam) };
+                let mut t = Transcription { audio: base.audio.clone(), vf: base.vf.clone(), lang, langs: alloc::vec![lang], open0, ctx, last_end, ..Transcription::empty(m, beam) };
                 let mut words = Vec::new();
                 for ws in &mut t {
                     words.extend(ws);
@@ -189,7 +202,7 @@ impl<'m> Transcription<'m> {
     fn plan(&self) -> Vec<Plan> {
         let (vf, n) = (&self.vf, self.vf.len());
         let mut out = Vec::new();
-        let (mut open0, mut ctx) = (0, 0);
+        let (mut open0, mut ctx) = (self.open0, self.ctx);
         while let Some(first) = (open0..n).find(|&i| vf[i]) {
             let cap_end = first + (CAP / FR) as usize;
             let (mut b, mut quiet, mut at_pause) = (first, 0, false);
@@ -220,19 +233,7 @@ impl<'m> Transcription<'m> {
             let end = quiet >= LONG;
             out.push(Plan { open0, ctx, first, b, end });
             open0 = b;
-            ctx = 0;
-            if !end {
-                // back from the cut until CTX_VOICED speech frames are covered
-                let (mut i, mut v) = (b, 0);
-                let lo = b.saturating_sub(CTX_MAX);
-                while i > lo && v < CTX_VOICED {
-                    i -= 1;
-                    if vf[i] {
-                        v += 1;
-                    }
-                }
-                ctx = if v > 0 { b - i } else { 0 };
-            }
+            ctx = if end { 0 } else { context_frames(vf, b) };
         }
         out
     }
@@ -441,6 +442,20 @@ impl Iterator for Transcription<'_> {
             return Some(out);
         }
     }
+}
+
+/// Frames of left context for a piece that starts at frame `b`: back from it until CTX_VOICED speech frames are
+/// covered, at most CTX_MAX; 0 if there is no speech before it.
+fn context_frames(vf: &[bool], b: usize) -> usize {
+    let (mut i, mut v) = (b, 0);
+    let lo = b.saturating_sub(CTX_MAX);
+    while i > lo && v < CTX_VOICED {
+        i -= 1;
+        if vf[i] {
+            v += 1;
+        }
+    }
+    if v > 0 { b - i } else { 0 }
 }
 
 /// Frame halfway between word j and j + 1.
