@@ -5,8 +5,9 @@ screen, a top-bar icon with a menu, and the preferences window. It talks to a se
 over stdin and stdout. The helper records with `pw-record` and runs a speech model in a sandbox
 without network access.
 
-**Why a helper outside the extension.** Speech recognition needs ONNX Runtime and NumPy, which have no
-GJS bindings, and a model of about 1 GB.
+**Why a helper outside the extension.** Speech recognition needs native code and a model of 35 MB to
+1 GB on disk: the Small model is a Rust program (`engine/`, built from source on the user's computer
+by `install.sh`). The Large model needs ONNX Runtime and NumPy, which have no GJS bindings.
 - The helper is readable Python, licensed GPL-3.0-or-later, and runs unprivileged:
   https://github.com/kcharukovskyi/dictator/tree/main/helper
 - The extension does not install or download the helper. The user installs it from the repository
@@ -25,8 +26,8 @@ GJS bindings, and a model of about 1 GB.
 **Network.** The extension has no network access.
 - The model download is in the helper. It runs only after the user clicks Download in preferences
   (or answers yes in `install.sh`).
-- It fetches fixed files from a pinned Hugging Face revision and checks each one against a hard-coded
-  SHA-256.
+- It fetches fixed files, from a pinned Hugging Face revision (Large) or a pinned GitHub commit of
+  tinyasr (Small), and checks each one against a hard-coded SHA-256.
 - These are model weights, not code.
 - Closing the preferences window stops the download.
 
