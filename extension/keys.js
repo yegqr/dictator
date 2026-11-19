@@ -242,21 +242,26 @@ export function writePrivacy(p) {
 // Speech settings; the helper reads all but space_after and pill.
 export const SPEECH_FILE = GLib.build_filenamev([DIR, 'speech']);
 export const REPLACE_FILE = GLib.build_filenamev([DIR, 'replacements']);
-// the speech model's 25 languages: [code, English name, own name]
+// every language a speech model knows: [code, English name, own name]. The large model (Parakeet) has
+// all but SMALL_ONLY; the small one (tinyasr) has those of its language packs (helper: dictate --models).
 export const LANGUAGES = Object.freeze([
     ['uk', 'Ukrainian', 'Українська'], ['en', 'English', 'English'], ['bg', 'Bulgarian', 'Български'],
     ['hr', 'Croatian', 'Hrvatski'], ['cs', 'Czech', 'Čeština'], ['da', 'Danish', 'Dansk'],
     ['nl', 'Dutch', 'Nederlands'], ['et', 'Estonian', 'Eesti'], ['fi', 'Finnish', 'Suomi'],
     ['fr', 'French', 'Français'], ['de', 'German', 'Deutsch'], ['el', 'Greek', 'Ελληνικά'],
-    ['hu', 'Hungarian', 'Magyar'], ['it', 'Italian', 'Italiano'], ['lv', 'Latvian', 'Latviešu'],
-    ['lt', 'Lithuanian', 'Lietuvių'], ['mt', 'Maltese', 'Malti'], ['pl', 'Polish', 'Polski'],
-    ['pt', 'Portuguese', 'Português'], ['ro', 'Romanian', 'Română'], ['ru', 'Russian', 'Русский'],
-    ['sk', 'Slovak', 'Slovenčina'], ['sl', 'Slovenian', 'Slovenščina'], ['es', 'Spanish', 'Español'],
-    ['sv', 'Swedish', 'Svenska'],
+    ['hu', 'Hungarian', 'Magyar'], ['it', 'Italian', 'Italiano'], ['km', 'Khmer', 'ខ្មែរ'],
+    ['lv', 'Latvian', 'Latviešu'], ['lt', 'Lithuanian', 'Lietuvių'], ['mt', 'Maltese', 'Malti'],
+    ['fa', 'Persian', 'فارسی'], ['pl', 'Polish', 'Polski'], ['pt', 'Portuguese', 'Português'],
+    ['ro', 'Romanian', 'Română'], ['ru', 'Russian', 'Русский'], ['sk', 'Slovak', 'Slovenčina'],
+    ['sl', 'Slovenian', 'Slovenščina'], ['es', 'Spanish', 'Español'], ['sv', 'Swedish', 'Svenska'],
+    ['uz', 'Uzbek', 'Oʻzbekcha'],
 ]);
+export const SMALL_ONLY = Object.freeze(['uz', 'fa', 'km']);
+// the speech model setting: small (tinyasr), or large (Parakeet) as int8 or fp32
+export const MODELS = Object.freeze(['small', 'int8', 'fp32']);
 export const SPEECH_DEFAULTS = Object.freeze({languages: ['uk', 'en', 'ru'], margin: 0.15, threads: 0,
     finalPeriod: 'keep', spaceAfter: false, microphone: 'default', autoStop: 0, voiceGate: 'off', pill: 'bottom',
-    spokenPunctuation: false, fillers: true, model: 'int8'});
+    spokenPunctuation: false, fillers: true, model: 'small'});
 // a line break the user dictated ("новий рядок"): the helper sends this private-use character, the
 // extension types a line break, or a space in a terminal (there a line break would run a command)
 export const NEWLINE_MARK = '\ue000';
@@ -294,7 +299,7 @@ export function readSpeech() {
             p.spokenPunctuation = v === 'on';
         } else if (m[1] === 'fillers') {
             p.fillers = v !== 'off';
-        } else if (m[1] === 'model' && ['int8', 'fp32'].includes(v)) {
+        } else if (m[1] === 'model' && MODELS.includes(v)) {
             p.model = v;
         }
     }
@@ -311,7 +316,7 @@ export function writeSpeech(p) {
         '# spoken_punctuation: on|off ("кома", "знак питання", "новий рядок"...); fillers: on|off (remove "еее", "um")\n' +
         '# microphone: default or a PipeWire source name (node.name in pw-dump); auto_stop: seconds of silence, 0 = off\n' +
         '# voice_gate: off|light|medium|strong (mute sound much quieter than your voice); pill: bottom|top\n' +
-        '# model: int8|fp32 (the model variant, if installed)\n' +
+        '# model: small|int8|fp32 (small: tinyasr; int8, fp32: Parakeet; if not installed, another one that is)\n' +
         `languages = ${p.languages.join(' ')}\nmargin = ${p.margin}\nthreads = ${p.threads}\n` +
         `final_period = ${p.finalPeriod}\nspace_after = ${p.spaceAfter ? 'on' : 'off'}\n` +
         `microphone = ${p.microphone}\nauto_stop = ${p.autoStop}\nvoice_gate = ${p.voiceGate}\npill = ${p.pill}\n` +

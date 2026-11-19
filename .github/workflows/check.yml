@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Checks every push and pull request: shell scripts, Python, JavaScript syntax, and the extension
-# package against the extensions.gnome.org review rules (shexli).
+# Checks every push and pull request: shell scripts, Python, JavaScript syntax, the extension package
+# against the extensions.gnome.org review rules (shexli), and the Small model's engine (engine/).
 name: Check
 
 on:
@@ -56,3 +56,34 @@ jobs:
               print(f"::error::{f['rule_id']}: {f['message']}")
           sys.exit(1 if bad else 0)
           EOF
+
+  engine:
+    # the Small model: the tinyasr library (engine/tinyasr) and its worker for the helper (engine/worker).
+    # No dependencies, so everything builds offline.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: tinyasr library
+        working-directory: engine/tinyasr
+        # a library: no Cargo.lock in the repository, so no --locked
+        run: |
+          cargo build --release --offline
+          cargo test --offline
+
+      - name: dictate-tinyasr worker
+        working-directory: engine/worker
+        run: |
+          cargo build --release --offline --locked
+          cargo test --offline --locked
+
+      - name: Static worker, as install.sh builds it
+        working-directory: engine/worker
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+          CARGO_TARGET_DIR: ${{ runner.temp }}/static
+        run: |
+          cargo build --release --offline --locked
+          if readelf -d "$CARGO_TARGET_DIR/release/dictate-tinyasr" | grep NEEDED; then
+            echo "::error::dictate-tinyasr needs shared libraries"; exit 1
+          fi

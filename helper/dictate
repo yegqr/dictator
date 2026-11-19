@@ -5,9 +5,10 @@
 
 Started by the Dictator GNOME extension for each recording. It records with pw-record until it gets
 "stop" or "cancel" on stdin ("pause" / "resume": the paused stretch is cut out) and turns it into text
-with the speech model (NVIDIA Parakeet TDT 0.6B v3, parakeet.py) in a sandbox without network. The
-recording is transcribed in pieces cut at your pauses WHILE you speak (class Streamer), so the text
-is there about a second after you stop, however long you spoke.
+with a speech model in a sandbox without network: Small (tinyasr language packs, run by the dictate-tinyasr
+worker built from engine/; the default) or Large (NVIDIA Parakeet TDT 0.6B v3, parakeet.py). The recording
+is transcribed in pieces cut at your pauses WHILE you speak (class Streamer), so the text is there about a
+second after you stop, however long you spoke.
 Protocol on stdout, one line each:
     L <0..1>      voice level, ~20 per second while recording
     S             recording finished, transcribing
@@ -21,20 +22,27 @@ deleted after keep_minutes. Nothing is written to the disk but settings, the mod
 (~/.cache/dictate/dictate.log, never any text). This program never touches the clipboard.
 
 Other commands:
-    dictate --models               installed model variants, as JSON (for the settings window)
-    dictate --download int8|fp32   download a model variant from Hugging Face (pinned revision, every
-                                   file checked against its SHA-256); the only network access
+    dictate --models               installed models, as JSON (for the settings window)
+    dictate --download int8|fp32   download a Large model variant from Hugging Face (pinned revision, every
+                                   file checked against its SHA-256)
+    dictate --download small[:PACK]
+                                   download Small model language packs from GitHub (pinned commit, every
+                                   file checked against its SHA-256): PACK, or the packs for your languages
+                                   The --download commands are the only network access.
     dictate --remove int8|fp32     delete a model variant
+    dictate --remove small:PACK    delete a language pack (the last one takes the Small model with it)
     dictate --try                  a test dictation (the settings window): like a recording, but
                                    nothing is kept, neither the audio nor the text
-    dictate --selftest             load the model once and check that its sandbox has no network
+    dictate --selftest             load the model (and Small too, if installed) once and check that its
+                                   sandbox has no network
     dictate --redo STAMP [LANG]    transcribe a recording from the history again (its audio is kept only
                                    with keep_audio on), as LANG or with the usual languages; prints S, then
                                    T or E, and the new text replaces the old one in the history
 
-Where the model runs: ~/.config/dictate/runtime holds "host" (system Python with onnxruntime + numpy,
+Where the Large model runs: ~/.config/dictate/runtime holds "host" (system Python with onnxruntime + numpy,
 in bubblewrap) or "podman" / "docker" (the offline "dictate-asr" image built from Containerfile).
 Without that file: host if those Python packages are installed, else podman, else docker.
+The Small model always runs on this computer, in bubblewrap (else not at all).
 """
 import array
 import io
@@ -55,9 +63,11 @@ CHUNK = RATE // 20 * 2                 # 50 ms of s16 mono
 MAX_SECONDS = 15 * 60                  # of speech (pauses not counted)
 MAX_WALL_SECONDS = 60 * 60             # with pauses
 MIN_SECONDS = 0.4
-# the speech model's 25 languages (lib/parakeet.py); which are on: ~/.config/dictate/speech
-LANGS = ["en", "de", "fr", "es", "it", "pt", "nl", "da", "sv", "fi", "pl", "cs", "sk", "sl", "hr", "hu",
-         "ro", "lv", "lt", "et", "mt", "uk", "ru", "bg", "el"]
+# the Large speech model's 25 languages (lib/parakeet.py); which are on: ~/.config/dictate/speech
+LARGE_LANGS = ["en", "de", "fr", "es", "it", "pt", "nl", "da", "sv", "fi", "pl", "cs", "sk", "sl", "hr", "hu",
+               "ro", "lv", "lt", "et", "mt", "uk", "ru", "bg", "el"]
+# every language a model knows: Large's and the Small model's (TINY_PACKS) uz, fa, km
+LANGS = LARGE_LANGS + ["uz", "fa", "km"]
 ASR_SCRIPT = os.path.expanduser("~/.local/lib/dictate/parakeet.py")
 MODEL_DIR = os.path.expanduser("~/.local/share/dictate/parakeet-tdt-0.6b-v3")
 ASR_IMAGE = "dictate-asr"
@@ -82,8 +92,34 @@ INT8_REFERENCE = {
     "decoder_joint-model.int8.onnx": "6cc5e3ef27047ff2344cfbf11d60fd4f11e0191e647010115c620ce58c99617f",
 }
 VARIANTS = {"int8": INT8_FILES, "fp32": FP32_FILES}
+MODELS = ("small", *VARIANTS)          # the `model` setting: Small (tinyasr) or a Large variant
 INT8_SIZE = 935138005                  # bytes the int8 files take
 QUANTIZE_MEMORY_GB = 6                 # free memory needed while converting to int8
+# The Small model: tinyasr (github.com/dkaraush/tinyasr) language packs at a fixed commit, run by our worker
+# dictate-tinyasr (engine/, built on this computer). Each file comes gzipped: the .gz and the unpacked file
+# are both checked against their SHA-256, and unpacking stops at the expected size.
+TINY_DIR = os.path.expanduser("~/.local/share/dictate/tinyasr")
+TINY_WORKER = os.path.expanduser("~/.local/lib/dictate/dictate-tinyasr")
+TINY_COMMIT = "1e7192467cfecb66abdd5fd3a2928b06127c7e3f"
+TINY_URL = f"https://raw.githubusercontent.com/dkaraush/tinyasr/{TINY_COMMIT}/models/"
+# pack: (languages, .gz bytes, .gz sha256, bytes, sha256). A language that several packs have is taken
+# from the first of them here.
+TINY_PACKS = {
+    "en-ru-uk": (["en", "ru", "uk"], 33400924, "76218281aa7418863a3821e382d39fc2adb93207bd6bf1741872710109e4e90a",
+                 38257681, "29930b8d2c20bb8d1a85e7a94891665d73b1c2c22581b9170073ac6b35284783"),
+    "en-es-it-pt": (["en", "es", "it", "pt"], 32201827,
+                    "ef230920b71bf9793e227976e817c117548c576ac3352672fd4cf6f232da2160",
+                    36923517, "98d3abe71079ee4362ec616306937c6b06142e060aad32554ab7fa59a76d8e71"),
+    "en-ru-uz": (["en", "ru", "uz"], 31070412, "54a7059ac81a1f0a5f2bb1967fb56600673e56252efb5a0b904b4b7d4e9fd07a",
+                 35686768, "167e9a0e9ad389e6688bf7ac554d73c7e0c345c8df71b9c16fdf98d01748a563"),
+    "en-fa": (["en", "fa"], 30111618, "ea568825aa9a1defc0554174779e918f08976886a6400fd3a9a4635bda14964f",
+              34619123, "94cbf4dcebb14e6224437d5e11c2f3892e09b5fdc0f97a40aa549241056f8bf8"),
+    "en-km": (["en", "km"], 30127681, "7c3ee314d4b31cac965ad04450938e8aee5e630bd1884806d20b191c2a2f71e2",
+              34618278, "611c01616d7fe705c6e365fd4fd44b3077f30db12c169d287b1a6d54c193797b"),
+}
+# the voice detector every pack needs (name, then as above): comes with the first pack, goes with the last
+TINY_VAD = ("silero_vad.onnx", 1945092, "cf8770c9376f65ffb8c6667bbca0edb993d9768902b3a0200b1041bcb16adaa4",
+            2327524, "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3")
 RUNTIME_FILE = os.path.expanduser("~/.config/dictate/runtime")
 LOAD_TIMEOUT_S = 90
 LOG_FILE = os.path.expanduser("~/.cache/dictate/dictate.log")
@@ -96,6 +132,8 @@ HISTORY_N = 3
 #   keep_audio = on|off    the history keeps the audio too (RAM only), so a text can be transcribed again
 PRIVACY_FILE = os.path.expanduser("~/.config/dictate/privacy")
 MAX_TEXT = 50000                       # 15 min of speech is ~20 000 characters
+# longest answer line read from a worker: 29 candidates of MAX_TEXT characters as 6-byte \u escapes = 8.7 MB
+MAX_ANSWER = 16 << 20
 
 
 def privacy():
@@ -128,14 +166,17 @@ def privacy():
 #   auto_stop = 0           finish by itself after this many seconds of silence (0 = never)
 #   voice_gate = off|light|medium|strong   mute sound much quieter than your voice (other people)
 #   pill = bottom|top       (used by the extension)
-#   model = int8|fp32       which model variant to use (if it is installed; else the other one)
+#   model = small|int8|fp32 Small (tinyasr) or a Large variant (if it is installed; else another one)
 # ~/.config/dictate/replacements: "words = replacement" per line, applied to every text
 SPEECH_FILE = os.path.expanduser("~/.config/dictate/speech")
 # How much surer a candidate language must be on top of `margin`, by (candidate, main language): the
 # model leans to some languages. Measured on Ukrainian dictation (one speaker, laptop and headset):
 # decoded as Russian it scored up to +0.52/s better than as Ukrainian, so Russian needs that much more
 # before it replaces Ukrainian. Pairs not listed are not known to lean: margin alone.
-LANG_BIAS = {("ru", "uk"): 0.45}
+LANG_BIAS = {("ru", "uk"): 0.45}            # Large only: no lean was measured for the Small model
+# The Small model's margin is the setting's times this (0.15 -> 0.05). Measured on dictation pieces: at 0.05
+# none of 513 main-language pieces went to another language and 1 of 299 real switches was missed; at 0.15, 5.
+SMALL_MARGIN_SCALE = 1 / 3
 # voice_gate: sound this many dB below your own voice is muted before recognition
 GATE_DB = {"off": 0, "light": 25, "medium": 18, "strong": 12}
 REPLACE_FILE = os.path.expanduser("~/.config/dictate/replacements")
@@ -144,7 +185,7 @@ REPLACE_FILE = os.path.expanduser("~/.config/dictate/replacements")
 def speech():
     p = {"languages": ["uk", "en", "ru"], "margin": 0.15, "threads": 0, "final_period": "keep",
          "microphone": "default", "auto_stop": 0, "voice_gate": "off", "spoken_punctuation": False,
-         "fillers": True, "model": "int8"}
+         "fillers": True, "model": "small"}
     try:
         with open(SPEECH_FILE) as f:
             for line in f:
@@ -171,7 +212,7 @@ def speech():
                     elif k in ("spoken_punctuation", "fillers"):
                         p[k] = v == "on"
                     elif k == "model":
-                        p[k] = v if v in VARIANTS else "int8"
+                        p[k] = v if v in MODELS else "small"
                     elif v in ("keep", "drop", "chats"):
                         p[k] = v
                 except ValueError:
@@ -290,6 +331,10 @@ def log(msg):
 
 class Fail(Exception):
     pass
+
+
+class Unusable(Fail):
+    """No model can run (none installed, no language pack): nothing is recorded."""
 
 
 # ------------------------------------------------------------------ recording
@@ -699,51 +744,79 @@ class Recognizer:
     starts so the model (~1.8 s to load) is ready when the speaking ends, and gone afterwards (its
     0.7-2.3 GB of memory are only used while dictating). In a container (podman/docker, image
     dictate-asr): no network, no access to your files (only the model folder, read-only), no
-    capabilities, its output is not logged anywhere."""
+    capabilities, its output is not logged anywhere. The Small model (dictate-tinyasr) always runs on
+    this computer, in tiny_sandbox()."""
 
-    def __init__(self):
+    def __init__(self, variant=None):
         self.proc = None
+        self.want = variant            # a model to use instead of the chosen one (selftest)
         self.via = self.variant = None
+        self.langs = None              # the languages the worker is asked for, main first
         self.ready = None              # load time once the worker said ready
         self.done = False              # closed for good (recording over or cancelled): no new worker
         self.waited = 0.0              # how long the first request waited for the model to load
 
-    def start(self):
-        """Starts the worker without waiting for it (the recording must not be delayed)."""
+    def start(self, settings=None):
+        """Starts the worker without waiting for it (the recording must not be delayed).
+        settings: speech settings to use instead of the saved ones (a chosen language)."""
         if self.done:
             raise Fail("Cancelled")
         if self.proc:
             return
-        try:
-            with open(ASR_SCRIPT) as f:
-                code = f.read()
-        except OSError:
-            raise Fail("Speech model program missing") from None
-        variant = model_variant()
-        if not variant:
-            raise Fail(MODEL_MISSING)
-        via = runtime()
-        prefix, model = sandbox(via)
-        threads = speech()["threads"]
-        cmd = prefix + ["-c", code, "--worker", model] + (["--threads", str(threads)] if threads else []) \
-            + (["--fp32"] if variant == "fp32" else [])
+        settings = settings or speech()
+        variant = self.want or model_variant()
+        threads = ["--threads", str(settings["threads"])] if settings["threads"] else []
+        if variant == "small":
+            langs, packs = small_plan(settings["languages"])
+            prefix, worker, folder = tiny_sandbox()
+            via = prefix[0]
+            cmd = prefix + [worker, "--worker", folder, "--packs", ",".join(packs)] + threads
+        else:
+            if not variant and small_broken():
+                raise Unusable(SMALL_PROGRAM_MISSING)
+            try:
+                with open(ASR_SCRIPT) as f:
+                    code = f.read()
+            except OSError:
+                raise Fail("Speech model program missing") from None
+            if not variant:
+                raise Unusable(MODEL_MISSING)
+            via = runtime()
+            prefix, model = sandbox(via)
+            cmd = prefix + ["-c", code, "--worker", model] + threads + (["--fp32"] if variant == "fp32" else [])
+            langs = [c for c in settings["languages"] if c in LARGE_LANGS]
+            if not langs:                       # only Small's languages enabled: Large's default ones
+                langs = ["uk", "en", "ru"]
+                log("no enabled language is known to the large model: uk en ru used")
         try:
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=subprocess.DEVNULL)
         except OSError as e:
             raise Fail(f"Speech model failed to start ({type(e).__name__})") from None
-        self.via, self.variant, self.ready = via, variant, None
+        self.via, self.variant, self.langs, self.ready = via, variant, langs, None
 
     @staticmethod
     def _line(proc, timeout):
-        """One JSON line from the worker; None if nothing within timeout (or it ended)."""
-        if timeout is not None:
-            sel = selectors.DefaultSelector()
-            sel.register(proc.stdout, selectors.EVENT_READ)
-            if not sel.select(timeout):
-                return None
-        line = proc.stdout.readline()
-        if not line:
+        """One JSON line from the worker: None if it is not all there within timeout, {} if the worker
+        ended or the line is not JSON or longer than MAX_ANSWER. Its output is untrusted: a line that
+        never ends cannot hold this past the timeout, nor can a huge one fill the memory."""
+        fd, end, buf = proc.stdout.fileno(), time.monotonic() + timeout, bytearray()
+        with selectors.DefaultSelector() as sel:
+            sel.register(fd, selectors.EVENT_READ)
+            while True:
+                left = end - time.monotonic()
+                if left <= 0 or not sel.select(left):
+                    return None
+                chunk = os.read(fd, 1 << 16)
+                if not chunk:
+                    return {}
+                buf += chunk
+                if b"\n" in chunk:
+                    break
+                if len(buf) > MAX_ANSWER:
+                    return {}
+        line = buf[:buf.index(b"\n")]
+        if len(line) > MAX_ANSWER:
             return {}
         try:
             return json.loads(line)
@@ -765,9 +838,9 @@ class Recognizer:
             proc.kill()
             proc.wait()
 
-    def _wait_ready(self):
+    def _wait_ready(self, settings=None):
         """Starts the worker if needed and waits until the model is loaded."""
-        self.start()
+        self.start(settings)
         if self.ready is None:
             t0 = time.monotonic()
             first = self._line(self.proc, LOAD_TIMEOUT_S)
@@ -777,20 +850,27 @@ class Recognizer:
             self.ready = first.get("load_s")
             self.waited = time.monotonic() - t0
 
-    def request(self, raw, settings):
+    def request(self, raw, settings, ctx=0):
         """One piece of a recording (Streamer). Returns the worker's answer (parakeet.py, lang
-        "pieces"), checked: {"cands": {code: [text, score]}, "main": code, "asr_s": s, "note": str}."""
-        self._wait_ready()
+        "pieces"), checked: {"cands": {code: [text, score]}, "main": code, "asr_s": s, "note": str}.
+        ctx: raw starts with this many bytes of the recording before the piece, context for the Small
+        model (parakeet.py does not take it: Large gets the piece alone)."""
+        self._wait_ready(settings)
+        if self.variant != "small":
+            raw, ctx = raw[ctx:], 0
+        req = {"n": len(raw), "lang": "pieces", "langs": self.langs,
+               "gate_db": GATE_DB[settings["voice_gate"]]}
+        if ctx:
+            req["ctx"] = ctx
         try:
-            self.proc.stdin.write(json.dumps({"n": len(raw), "lang": "pieces", "langs": settings["languages"],
-                                              "gate_db": GATE_DB[settings["voice_gate"]]}).encode() + b"\n")
+            self.proc.stdin.write(json.dumps(req).encode() + b"\n")
             self.proc.stdin.write(raw)
             self.proc.stdin.flush()
         except (OSError, ValueError, AttributeError):    # closed meanwhile by close() (cancel)
             self.close()
             raise Fail("Speech model stopped") from None
         res = self._line(self.proc, 60 + len(raw) / 2 / RATE)
-        if not valid_answer(res):
+        if not valid_answer(res, self.langs):
             err = res.get("error") if isinstance(res, dict) else None
             log(f"model error via {self.via}: {err if isinstance(err, str) else 'no valid answer'}"[:300])
             self.close()
@@ -805,13 +885,15 @@ class Recognizer:
         self.proc, self.ready = None, None
 
 
-def valid_answer(res):
-    """The worker's answer to a piece has exactly the expected shape. It runs in a sandbox, but its
-    output is still treated as untrusted input: anything else is an error, never used."""
+def valid_answer(res, langs):
+    """The worker's answer to a piece has exactly the expected shape, and its candidates are languages it
+    was asked for (langs; "auto": parakeet.py's key for its only candidate). It runs in a sandbox, but its
+    output is still treated as untrusted input: anything else is an error, never used (nor logged)."""
     if not isinstance(res, dict) or "error" in res:
         return False
     cands, main = res.get("cands"), res.get("main")
     return (isinstance(cands, dict) and 0 < len(cands) <= len(LANGS) + 1 and main in cands
+            and set(cands) <= set(langs) | {"auto"}
             and all(isinstance(c, str) and isinstance(v, list) and len(v) == 2 and isinstance(v[0], str)
                     and len(v[0]) <= MAX_TEXT and isinstance(v[1], (int, float)) and math.isfinite(v[1])
                     for c, v in cands.items())
@@ -829,6 +911,8 @@ class Streamer:
     drops whole phrases; ~5 s pieces give worse words (too little context); 10-25 s were best.
     Silence: pieces are trimmed to EDGE_S of silence at both ends, and a piece with almost no voice is
     not sent at all (from noise the model invents words, e.g. "Well yeah, I'm definitely").
+    The Small model also hears the CONTEXT_S before each piece, without writing it: started cold in the
+    middle of speech it can skip a piece's first words, often a whole sentence.
     Language: each piece comes back decoded in every candidate language (parakeet.py, lang "pieces");
     the language is chosen once, from the scores summed over the whole recording, because one short
     piece is too little to tell Ukrainian from Russian.
@@ -842,6 +926,7 @@ class Streamer:
     SIL_DB = 10.0                     # a frame is silence below the noise floor + this
     EDGE_S = 0.3
     MIN_VOICE_S = 0.25                # less voice than this in a piece: not sent
+    CONTEXT_S = 4.0                   # Small hears this much before a piece (else it can skip its start)
 
     def __init__(self, rec, settings=None):
         import queue
@@ -866,12 +951,12 @@ class Streamer:
             item = self.q.get()
             if item is None:
                 return
-            piece, raw = item
+            piece, raw, ctx = item
             if self.error or self.stopped:
                 continue
             for attempt in (1, 2):                 # the worker died: start a new one, try once more
                 try:
-                    piece[2] = self.rec.request(raw, self.settings)
+                    piece[2] = self.rec.request(raw, self.settings, ctx)
                     break
                 except Exception as e:             # Fail, or the worker was closed under us (cancel)
                     if attempt == 2 or self.stopped:
@@ -936,7 +1021,8 @@ class Streamer:
         b0, b1 = s * self.FRAME, (end_byte if tail and e2 == e else e2 * self.FRAME)
         piece = [b0, b1, None]
         self.pieces.append(piece)
-        self.q.put((piece, bytes(self.buf[b0:b1])))
+        c0 = max(0, b0 - int(self.CONTEXT_S / 0.02) * self.FRAME)
+        self.q.put((piece, bytes(self.buf[c0:b1]), b0 - c0))
 
     # -- the end
     def finish(self, final):
@@ -972,7 +1058,8 @@ class Streamer:
 
     def choose(self, res, seconds):
         """(text, log note): the main language unless another candidate is surer, per second summed
-        over all pieces, by more than margin plus the model's known lean to it (LANG_BIAS)."""
+        over all pieces, by more than margin plus the model's known lean to it (LANG_BIAS; for the
+        Small model margin * SMALL_MARGIN_SCALE and no lean)."""
         if not res:
             return "", "no voice"
         main = res[0]["main"]
@@ -984,11 +1071,26 @@ class Streamer:
             pick, lnote = main, ("lang same" if len(codes) > 1 else f"langs {'+'.join(self.settings['languages'])}")
         else:
             score = {c: sum(r["cands"][c][1] for r in res) for c in codes}
-            best = max(codes, key=lambda c: score[c])
+            heard = [c for c in codes if any(t.strip() for t in texts[c])]
+            # a language that heard nothing in any piece never replaces a main language that heard words
+            best = max(heard if main in heard else codes, key=lambda c: score[c])
             diff = (score[best] - score[main]) / seconds
-            pick = best if diff > self.settings["margin"] + LANG_BIAS.get((best, main), 0.0) else main
+            small = self.rec.variant == "small"
+            bias = {} if small else LANG_BIAS
+            margin = self.settings["margin"] * (SMALL_MARGIN_SCALE if small else 1)
+            pick = best if diff > margin + bias.get((best, main), 0.0) else main
             lnote = f"lang {pick} ({best}-{main} {diff:+.3f}/s)"
         return " ".join(t.strip() for t in texts[pick] if t and t.strip()), lnote
+
+
+# bubblewrap for both models: every namespace its own (so no network), no environment, read-only /usr
+# and nothing else of this computer; sandbox() and tiny_sandbox() add the model's folder
+BWRAP_BASE = ["bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--clearenv",
+              "--setenv", "PATH", "/usr/bin", "--setenv", "HOME", "/tmp",
+              "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin", "--symlink", "usr/sbin", "/sbin",
+              "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64",
+              "--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache",
+              "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
 
 
 def sandbox(via, folder=MODEL_DIR, writable=False):
@@ -1010,13 +1112,7 @@ def sandbox(via, folder=MODEL_DIR, writable=False):
                  "-v", f"{folder}:/m:{'rw' if writable else 'ro'},z", ASR_IMAGE, "python3", "-I"], "/m")
     py = sys.executable
     if shutil.which("bwrap"):
-        cmd = ["bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--clearenv",
-               "--setenv", "PATH", "/usr/bin", "--setenv", "HOME", "/tmp",
-               "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin", "--symlink", "usr/sbin", "/sbin",
-               "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64",
-               "--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache",
-               "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-               "--bind" if writable else "--ro-bind", folder, "/m"]
+        cmd = BWRAP_BASE + ["--bind" if writable else "--ro-bind", folder, "/m"]
         for d in {sys.prefix, sys.base_prefix}:          # a Python outside /usr: make it visible too
             if not d.startswith("/usr"):
                 cmd += ["--ro-bind", d, d]
@@ -1029,12 +1125,31 @@ def sandbox(via, folder=MODEL_DIR, writable=False):
     raise Fail("No sandbox for the speech model (install bubblewrap)")
 
 
-# run inside sandbox(): tries to reach the internet (by IP, so no DNS needed)
+def tiny_sandbox():
+    """(argv prefix, the worker's path in there, the pack folder's path in there) for the Small model. It
+    always runs on this computer, in bubblewrap: no network (own empty network namespace), own user/PID/IPC
+    namespaces, sees only /usr, the worker and the pack folder (all read-only), not your home folder.
+    Without bubblewrap it does not start (fail closed): unshare --net alone would leave your files, D-Bus
+    and systemd in its reach. Never a container: the runtime setting is for Large."""
+    if not shutil.which("bwrap"):
+        raise Unusable(SMALL_NEEDS_BWRAP)
+    return (BWRAP_BASE + ["--ro-bind", TINY_WORKER, "/w/dictate-tinyasr", "--ro-bind", TINY_DIR, "/m", "--"],
+            "/w/dictate-tinyasr", "/m")
+
+
+# run inside sandbox(): "blocked" only if it is in its own empty network namespace (no network interface but
+# loopback, as in every sandbox here) and cannot reach the internet (by IP, so no DNS needed); else "OPEN".
+# A failed connection alone is not enough: an offline computer or a firewall would pass without a sandbox.
 NETCHECK = """import socket
+own = False
 try:
-    socket.create_connection(("1.1.1.1", 443), 3).close(); print("OPEN")
+    with open("/proc/self/net/dev") as f:
+        own = all(l.split(":")[0].strip() == "lo" for l in f.read().splitlines()[2:])
+    socket.create_connection(("1.1.1.1", 443), 3).close()
+    own = False
 except OSError:
-    print("blocked")"""
+    pass
+print("blocked" if own else "OPEN")"""
 
 
 def runtime():
@@ -1147,6 +1262,8 @@ MODEL_MISSING = "Speech model not installed: Settings, page Speech"
 
 
 def installed(variant):
+    if variant == "small":
+        return os.access(TINY_WORKER, os.X_OK) and tiny_ok(TINY_VAD) and bool(small_packs())
     names = COMMON_FILES + VARIANTS[variant]
     return all(os.path.isfile(os.path.join(MODEL_DIR, n)) and
                (n not in MODEL_FILES or os.path.getsize(os.path.join(MODEL_DIR, n)) == MODEL_FILES[n][0])
@@ -1154,9 +1271,90 @@ def installed(variant):
 
 
 def model_variant():
-    """The variant chosen in Settings if it is installed, else the other one, else None."""
+    """The model chosen in Settings if it is installed, else another installed one (the other Large
+    variant first), else None."""
     want = speech()["model"]
-    return next((v for v in (want, *VARIANTS) if installed(v)), None)
+    return next((v for v in (want, *VARIANTS, "small") if installed(v)), None)
+
+
+SMALL_PROGRAM_MISSING = "The Small model's program is missing: run install.sh again"
+SMALL_NEEDS_BWRAP = "The Small model needs bubblewrap (its sandbox without network): install the bubblewrap package"
+
+
+def tiny_file(pack):
+    """(file name, .gz bytes, .gz sha256, bytes, sha256) of a language pack, like TINY_VAD"""
+    return (pack + ".tzf", *TINY_PACKS[pack][1:])
+
+
+def tiny_ok(entry):
+    """The file is in place with its size (its SHA-256 was checked when it was installed)."""
+    path = os.path.join(TINY_DIR, entry[0])
+    return os.path.isfile(path) and os.path.getsize(path) == entry[3]
+
+
+def small_packs():
+    """the installed language packs, in TINY_PACKS order"""
+    return [p for p in TINY_PACKS if tiny_ok(tiny_file(p))]
+
+
+def pack_for(lang, packs):
+    """the first of packs that has lang, or None"""
+    return next((p for p in packs if lang in TINY_PACKS[p][0]), None)
+
+
+def small_plan(languages):
+    """For the Small model: (the enabled languages the installed packs have, main first; the packs to
+    load, the main language's first). None of them: an error that names the pack to download."""
+    have = small_packs()
+    langs = [c for c in languages if pack_for(c, have)]
+    if not langs:
+        want = next(iter(pick_packs(languages, TINY_PACKS)), None)
+        if want:
+            raise Unusable(f"The Small model has no language pack for {' '.join(languages)}: download {want} "
+                           "(Settings, page Speech)")
+        raise Unusable(f"The Small model does not know {' '.join(languages)}: choose other languages "
+                       "or the Large model (Settings, page Speech)")
+    return langs, pick_packs(langs, have)
+
+
+def pick_packs(languages, packs):
+    """The packs for these languages, main first (the same rule as install.sh): each language but en takes
+    the first of packs (in TINY_PACKS order) that has it; en adds the first one with en only if nothing
+    else was picked (en then comes from the first picked pack that has it)."""
+    out = []
+    for c in languages:
+        p = pack_for(c, packs) if c != "en" else None
+        if p and p not in out:
+            out.append(p)
+    if not out and "en" in languages and pack_for("en", packs):
+        out.append(pack_for("en", packs))
+    return out
+
+
+def download_packs(languages):
+    """the packs `dictate --download small` gets for the enabled languages (en-ru-uk if none has one)"""
+    return pick_packs(languages, TINY_PACKS) or ["en-ru-uk"]
+
+
+def small_broken():
+    """language packs there, but not the program that runs them"""
+    return bool(small_packs()) and not os.access(TINY_WORKER, os.X_OK)
+
+
+def small_models():
+    """The Small model for `dictate --models`. A pack's download and size include the voice detector
+    while that is not installed (it comes with the first pack)."""
+    have = small_packs()
+    vad = (0, 0) if tiny_ok(TINY_VAD) else (TINY_VAD[1], TINY_VAD[3])
+
+    def disk(p):
+        path = os.path.join(TINY_DIR, p + ".tzf")
+        return os.path.getsize(path) if os.path.isfile(path) else 0
+    return {"dir": TINY_DIR, "source": TINY_URL, "worker": os.access(TINY_WORKER, os.X_OK),
+            "installed": installed("small"),
+            "languages": list(dict.fromkeys(c for p in have for c in TINY_PACKS[p][0])),
+            "packs": {p: {"languages": v[0], "installed": p in have, "disk": disk(p),
+                          "download": v[1] + vad[0], "size": v[3] + vad[1]} for p, v in TINY_PACKS.items()}}
 
 
 def models():
@@ -1168,20 +1366,21 @@ def models():
     common = sum(MODEL_FILES[n][0] for n in COMMON_FILES)
     print(json.dumps({
         "dir": MODEL_DIR, "source": MODEL_URL, "chosen": speech()["model"], "used": model_variant(),
-        "busy": locked(),
+        "busy": locked() or locked(TINY_DIR),
         "variants": {
             "int8": {"installed": installed("int8"), "disk": disk("int8"), "size": INT8_SIZE + common,
                      "download": fp32 + common, "memory_gb": QUANTIZE_MEMORY_GB},
             "fp32": {"installed": installed("fp32"), "disk": disk("fp32"), "size": fp32 + common,
                      "download": fp32 + common},
-        }}))
+        },
+        "small": small_models()}))
 
 
-def locked():
-    """True while another `dictate --download` runs."""
+def locked(folder=MODEL_DIR):
+    """True while another `dictate --download` runs (into folder: MODEL_DIR Large, TINY_DIR Small)."""
     import fcntl
     try:
-        with open(os.path.join(MODEL_DIR, ".lock"), "a") as f:
+        with open(os.path.join(folder, ".lock"), "a") as f:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return False
     except BlockingIOError:
@@ -1222,11 +1421,12 @@ def sha256_of(path, progress=None):
     return h.hexdigest()
 
 
-def fetch(name, dest_dir, progress):
-    """Download one model file into dest_dir (resuming a partial download) and check its SHA-256."""
+def fetch(name, dest_dir, progress, source=None):
+    """Download one model file into dest_dir (resuming a partial download) and check its SHA-256.
+    source: (url, bytes, sha256); without it the Large model's file `name`."""
     import urllib.error
     import urllib.request
-    size, digest = MODEL_FILES[name]
+    url, size, digest = source or (MODEL_URL + name, *MODEL_FILES[name])
     path = os.path.join(dest_dir, name)
     if os.path.isfile(path) and os.path.getsize(path) == size and sha256_of(path) == digest:
         progress.add(size)
@@ -1238,7 +1438,7 @@ def fetch(name, dest_dir, progress):
         have = 0
     progress.add(have)
     if have < size:
-        req = urllib.request.Request(MODEL_URL + name, headers={"User-Agent": "dictator-model-download"})
+        req = urllib.request.Request(url, headers={"User-Agent": "dictator-model-download"})
         if have:
             req.add_header("Range", f"bytes={have}-")
         try:
@@ -1248,6 +1448,11 @@ def fetch(name, dest_dir, progress):
                     have = 0
                 with open(part, "ab" if have else "wb") as f:
                     while block := r.read(1 << 20):
+                        have += len(block)
+                        if have > size:                 # more than the file has: never fill the disk
+                            f.close()
+                            discard(part)               # junk: the next try starts clean
+                            raise Fail(f"{name}: the server sends more than the expected file. Try again later")
                         f.write(block)
                         progress.add(len(block))
         except (urllib.error.URLError, OSError) as e:
@@ -1260,17 +1465,33 @@ def fetch(name, dest_dir, progress):
     return path
 
 
-def download(variant):
-    """Install a model variant. fp32: download it. int8: download the fp32 files into a work folder,
-    convert them on this computer (in the sandbox, no network), keep the int8 files, delete the rest."""
+def download_lock(folder):
+    """Creates folder and locks its .lock for this download (Fail if another one is running); a SIGTERM
+    (cancelled) ends the program, so the finally blocks clean up. Keep the returned file while downloading."""
     import fcntl
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    lock = open(os.path.join(MODEL_DIR, ".lock"), "a")
+    os.makedirs(folder, exist_ok=True)
+    lock = open(os.path.join(folder, ".lock"), "a")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        lock.close()
         raise Fail("A download is already running") from None
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))   # cancelled: the finally blocks clean up
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+    return lock
+
+
+def finished(msg):
+    """The end of a download: msg in a terminal, else "D" (for the settings window)."""
+    if sys.stdout.isatty():
+        print(msg)
+    else:
+        out("D")
+
+
+def download(variant):
+    """Install a model variant. fp32: download it. int8: download the fp32 files into a work folder,
+    convert them on this computer (in the sandbox, no network), keep the int8 files, delete the rest."""
+    lock = download_lock(MODEL_DIR)            # held while this runs
     work = os.path.join(MODEL_DIR, ".work")
     fp32 = sum(MODEL_FILES[n][0] for n in FP32_FILES)
     need = sum(MODEL_FILES[n][0] for n in COMMON_FILES) + fp32 + (INT8_SIZE if variant == "int8" else 0)
@@ -1304,10 +1525,7 @@ def download(variant):
         log(f"model int8 {'identical to' if same else 'differs slightly from'} the reference build")
     write_notice()
     log(f"model {variant} installed")
-    if sys.stdout.isatty():
-        print("The speech model is installed.")
-    else:
-        out("D")
+    finished("The speech model is installed.")
 
 
 def partial_bytes(work):
@@ -1401,11 +1619,106 @@ def remove(variant):
     log(f"model {variant} removed")
 
 
+def download_small(packs):
+    """Install Small model language packs (the voice detector comes with the first one): download each
+    .gz into a work folder (resuming a partial download) and check its SHA-256, unpack it with a hard size
+    limit and check the unpacked file's SHA-256, and only then move the files in place. Anything wrong:
+    nothing new is installed."""
+    lock = download_lock(TINY_DIR)             # held while this runs
+    work = os.path.join(TINY_DIR, ".work")
+    files = [tiny_file(p) for p in packs if not tiny_ok(tiny_file(p))]
+    if files and not tiny_ok(TINY_VAD):
+        files.append(TINY_VAD)                  # last: a bad pack fails before it is fetched
+    need = sum(e[1] + e[3] for e in files)
+    if shutil.disk_usage(TINY_DIR).free < need - partial_bytes(work) + 50_000_000:
+        raise Fail(f"Not enough free disk space: {need / 1e6:.0f} MB needed in {TINY_DIR}")
+    log(f"model download: small {','.join(packs)}")
+    progress = Progress("download", sum(e[1] for e in files))
+    try:
+        os.makedirs(work, exist_ok=True)
+        for e in files:
+            fetch(e[0] + ".gz", work, progress, (TINY_URL + e[0] + ".gz", e[1], e[2]))
+        for e in files:
+            gunzip(os.path.join(work, e[0] + ".gz"), os.path.join(work, e[0]), e[3], e[4])
+        for e in reversed(files):               # the voice detector first: a pack is never there without it
+            os.replace(os.path.join(work, e[0]), os.path.join(TINY_DIR, e[0]))
+        shutil.rmtree(work)
+    finally:
+        for e in files:                         # unpacked but not installed
+            discard(os.path.join(work, e[0]))
+    write_small_notice()
+    log(f"model small {','.join(packs)} installed")
+    finished("The language pack is installed." if len(packs) == 1 else "The language packs are installed.")
+
+
+def gunzip(src, dest, size, digest):
+    """Unpack src into dest, stopping beyond `size` bytes (a .gz can unpack to far more than it holds),
+    and check the result's SHA-256. Anything wrong: both files are deleted."""
+    import gzip
+    import hashlib
+    import zlib
+    h, n, name = hashlib.sha256(), 0, os.path.basename(dest)
+    try:
+        with gzip.open(src, "rb") as f, open(dest, "wb") as o:
+            while block := f.read(1 << 20):
+                n += len(block)
+                if n > size:
+                    raise Fail(f"{name}: unpacks to more than the expected {size} bytes. Deleted it")
+                h.update(block)
+                o.write(block)
+        if n != size or h.hexdigest() != digest:
+            raise Fail(f"{name}: the unpacked file is not the expected one (SHA-256 differs). Deleted it")
+    except (OSError, EOFError, zlib.error) as e:
+        discard(dest)
+        discard(src)
+        raise Fail(f"{name}: unpacking failed ({type(e).__name__}). Deleted it") from None
+    except Fail:
+        discard(dest)
+        discard(src)
+        raise
+
+
+def remove_small(pack):
+    discard(os.path.join(TINY_DIR, pack + ".tzf"))
+    if not small_packs():                       # the last one: the voice detector and the folder go too
+        shutil.rmtree(TINY_DIR, ignore_errors=True)
+    log(f"model small {pack} removed")
+
+
+def write_small_notice():
+    with open(os.path.join(TINY_DIR, "NOTICE.txt"), "w") as f:
+        f.write(f"""Speech model (Small): tinyasr language packs and the Silero VAD voice detector
+  Original: https://github.com/dkaraush/tinyasr, folder models/, commit {TINY_COMMIT}
+  tinyasr by Danil Karaush, including the model files in models/: GNU General Public License v3.0 or
+  later (GPL-3.0-or-later), https://www.gnu.org/licenses/gpl-3.0.html
+  The models were trained primarily on YODAS v3 (ESPnet, https://huggingface.co/datasets/espnet/yodas3,
+  CC BY 3.0, https://creativecommons.org/licenses/by/3.0/), a corpus of Creative Commons-licensed
+  YouTube audio; see the dataset card for per-source attribution.
+  Voice activity detection (silero_vad.onnx): Silero VAD, https://github.com/snakers4/silero-vad (MIT).
+
+Changes made to the original:
+  None to these files: they are the files above, unpacked from .gz, each checked against its SHA-256.
+  The program that runs them (dictate-tinyasr) is built on this computer from Dictator's changed copy of
+  tinyasr (GPL-3.0-or-later); the changes are in the engine/ folder of Dictator's source code.
+
+Dictator is not affiliated with, sponsored or endorsed by the author of tinyasr.
+""")
+
+
 def model_command(cmd, variant):
     try:
-        if variant not in VARIANTS:
-            raise Fail(f"Unknown model variant {variant!r} (int8 or fp32)")
-        (download if cmd == "--download" else remove)(variant)
+        if variant == "small" or variant.startswith("small:"):
+            pack = variant[6:]
+            if pack not in TINY_PACKS and (pack or cmd == "--remove"):
+                raise Fail(f"Unknown language pack {pack!r} ({', '.join(TINY_PACKS)})")
+            if cmd == "--remove":
+                remove_small(pack)
+            else:
+                download_small([pack] if pack else download_packs(speech()["languages"]))
+        elif variant not in VARIANTS:
+            raise Fail(f"Unknown model variant {variant!r} (small, small:PACK, int8 or fp32)")
+        else:
+            (download if cmd == "--download" else remove)(variant)
     except Fail as e:
         print(f"Error: {e}" if sys.stdout.isatty() else f"E {e}", flush=True)
         sys.exit(1)
@@ -1422,7 +1735,7 @@ def main(trial=False):
         try:
             rec.start()                                   # loads while you speak
         except Fail as e:
-            if str(e) == MODEL_MISSING:                   # nothing to transcribe with: do not record
+            if isinstance(e, Unusable):                   # nothing to transcribe with: do not record
                 out(f"E {e}")
                 return
             log(f"model start: {e}")                      # record anyway; the recording is kept
@@ -1511,6 +1824,8 @@ def redo(stamp, lang=None):
     try:
         if not re.fullmatch(r"rec-\d{8}-\d{6}", stamp) or lang not in (None, *LANGS):
             raise Fail("Bad request")
+        if lang and lang not in LARGE_LANGS and model_variant() not in (None, "small"):
+            raise Fail(f"Bad request: the Large model does not know {lang}")
         try:
             with open(os.path.join(HISTORY_DIR, stamp + ".wav"), "rb") as f:
                 wav = f.read()
@@ -1537,27 +1852,34 @@ def redo(stamp, lang=None):
 
 
 def selftest():
-    """Starts the model and transcribes 1 s of silence: checks the runtime and the model files."""
-    t0 = time.monotonic()
-    rec = Recognizer()
-    try:
-        res = rec.request(b"\0\0" * RATE, speech())
-        print(f"OK: the speech model works ({rec.variant} via {rec.via}, load {rec.ready}s, "
-              f"asr {res.get('asr_s')}s, {time.monotonic() - t0:.1f}s in all)")
-        prefix, _ = sandbox(rec.via)
+    """Starts the model in use (and the Small model too, if it is installed) and transcribes 1 s of
+    silence: checks the runtime and the model files, and that the model's sandbox has no network."""
+    used = model_variant()
+    for variant in [used] + (["small"] if used not in (None, "small") and installed("small") else []):
+        t0 = time.monotonic()
+        rec = Recognizer(variant)
         try:
-            net = subprocess.run(prefix + ["-c", NETCHECK], capture_output=True, text=True,
-                                 timeout=60).stdout.strip()
-        except (OSError, subprocess.SubprocessError):
-            net = "?"
-        if net != "blocked":
-            raise Fail(f"the speech model's sandbox does not block the network (got {net!r})")
-        print(f"OK: no network for the speech model ({prefix[0]} sandbox)")
-    except Fail as e:
-        print(f"FAILED: {e}. Details: ~/.cache/dictate/dictate.log")
-        sys.exit(1)
-    finally:
-        rec.close()
+            res = rec.request(b"\0\0" * RATE, speech())
+            print(f"OK: the speech model works ({rec.variant} via {rec.via}, load {rec.ready}s, "
+                  f"asr {res.get('asr_s')}s, {time.monotonic() - t0:.1f}s in all)")
+            if variant == "small":                    # the worker's own check, in the worker's sandbox
+                prefix, worker, _ = tiny_sandbox()
+                cmd = prefix + [worker, "--netcheck"]
+            else:
+                prefix = sandbox(rec.via)[0]
+                cmd = prefix + ["-c", NETCHECK]
+            try:
+                net = subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                net = "?"
+            if net != "blocked":
+                raise Fail(f"the speech model's sandbox does not block the network (got {net!r})")
+            print(f"OK: no network for the speech model ({prefix[0]} sandbox)")
+        except Fail as e:
+            print(f"FAILED: {e}. Details: ~/.cache/dictate/dictate.log")
+            sys.exit(1)
+        finally:
+            rec.close()
 
 
 if __name__ == "__main__":

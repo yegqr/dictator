@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# dictate-tinyasr: the small speech model's worker for the Dictator helper (helper/dictate). No dependencies but
+# the tinyasr library next to it, so it builds offline: cargo build --release --offline --locked
+[package]
+name = "dictate-tinyasr"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+tinyasr = { path = "../tinyasr" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
