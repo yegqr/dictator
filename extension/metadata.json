@@ -1,7 +1,7 @@
 {
   "uuid": "dictator@kcharukovskyi.github.io",
   "name": "Dictator",
-  "description": "Offline voice dictation. Press Ctrl+Alt+Space, speak, press Enter: the text is typed where your cursor was.\n\nSpeech recognition runs on your computer (NVIDIA Parakeet TDT 0.6B v3, 25 European languages) in a sandbox without network access. Audio never leaves the machine.\n\nNeeds the Dictator helper program and a speech model, installed separately: see the project page. The speech model is then downloaded from the settings window.\n\nClipboard: used only when you copy a recent text from the top-bar menu, or, if you turn it on in the settings (off by default), to paste into apps that cannot take typed text.\n\nNot affiliated with NVIDIA.",
+  "description": "Offline voice dictation. Press Ctrl+Alt+Space, speak, press Enter: the text is typed where your cursor was.\n\nSpeech recognition runs on your computer (Small: tinyasr, 9 languages, the default; or Large: NVIDIA Parakeet TDT 0.6B v3, 25 European languages) in a sandbox without network access. Audio never leaves the machine.\n\nNeeds the Dictator helper program and a speech model, installed separately: see the project page. The speech model is then downloaded from the settings window.\n\nClipboard: used only when you copy a recent text from the top-bar menu, or, if you turn it on in the settings (off by default), to paste into apps that cannot take typed text.\n\nNot affiliated with NVIDIA.",
   "version-name": "1.0.0",
   "url": "https://github.com/kcharukovskyi/dictator",
   "session-modes": [

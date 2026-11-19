@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: 2025-2026 The Dictator authors (see AUTHORS)
 // Settings window (top-bar microphone menu -> Settings). Two pages:
 //   General  shortcuts, privacy, appearance
-//   Speech   the speech model (download / remove, through the helper), languages, text, recording
+//   Speech   the speech model (Small with its language packs, or Large; download / remove through the
+//            helper), languages, text, recording
 // Settings are saved in ~/.config/dictate (see keys.js).
 import Adw from 'gi://Adw';
 import Gdk from 'gi://Gdk';
@@ -12,7 +13,7 @@ import Gtk from 'gi://Gtk';
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 import {setReader, readKeys, writeKeys, readPrivacy, writePrivacy, readSpeech, writeSpeech, ensureReplacements, readPillSpot,
     writePillSpot, againLanguages, prettyAccel, gnomeShortcuts, NEWLINE_MARK, LANGUAGES, CAPS, NONE, SAME, SHIFT_CAPS,
-    DEFAULTS} from './keys.js';
+    DEFAULTS, SMALL_ONLY} from './keys.js';
 
 const THREAD_CHOICES = [[0, 'Automatic'], [1, '1'], [2, '2'], [4, '4'], [6, '6'], [8, '8']];
 const STOP_CHOICES = [[0, 'Off'], [2, 'After 2 seconds'], [3, 'After 3 seconds'], [5, 'After 5 seconds'],
@@ -22,13 +23,24 @@ const PILL_CHOICES = [['bottom', 'Bottom'], ['top', 'Top']];
 const HELPER = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'dictate']);
 const REPO = 'https://github.com/kcharukovskyi/dictator';
 const VARIANTS = [
-    {id: 'int8', title: 'Standard', note: v => `Recommended. Takes ${gb(v.size)}. Made on this computer from a ` +
+    {id: 'int8', title: 'Standard', note: v => `The better of the two. Takes ${gb(v.size)}. Made on this computer from a ` +
         `${gb(v.download)} download, which needs ${v.memory_gb} GB of free memory for about a minute`},
     {id: 'fp32', title: 'Full Precision', note: v => `Slightly more accurate, about half as fast. ` +
         `${gb(v.download)} download, takes ${gb(v.size)}`},
 ];
 
 const gb = bytes => `${(bytes / 1e9).toFixed(1)} GB`;
+const mb = bytes => `${Math.round(bytes / 1e6)} MB`;
+
+// English names; the large model's languages (the small one's come from its packs, see smallCodes)
+const NAMES = new Map(LANGUAGES.map(([c, en]) => [c, en]));
+const LARGE_CODES = new Set(LANGUAGES.map(([c]) => c).filter(c => !SMALL_ONLY.includes(c)));
+// a pack's languages in words: "English, Russian, Ukrainian"
+const inWords = codes => codes.map(c => NAMES.get(c) ?? c).join(', ');
+// the model the settings show: the one in use, else the chosen one
+const current = info => info?.used ?? info?.chosen ?? 'small';
+// the small model's languages: those of its packs
+const smallCodes = info => new Set(Object.values(info.small.packs ?? {}).flatMap(p => p.languages ?? []));
 
 // what the helper says about the model files (see helper/dictate --models), or null without the helper
 function modelInfo() {
@@ -103,6 +115,7 @@ function same(a, b) {
 // row subtitles, toasts and status descriptions are Pango markup: plain text (an accelerator like
 // <Super>d, an error message) must be escaped
 const esc = text => GLib.markup_escape_text(text, -1);
+const toast = (window, title) => window.add_toast(new Adw.Toast({title: esc(title), timeout: 5}));
 
 // the settings window runs in its own process, not in GNOME Shell: it reads the settings files directly
 function readFile(path) {
@@ -240,23 +253,34 @@ export default class DictatorPrefs extends ExtensionPreferences {
             const now = readSpeech();
             writeSpeech({...sp, pill: now.pill, model: now.model});
         };
-        const [model, ready] = this._modelGroup(window);
+        let show = () => {};        // shows the languages of the chosen model (set below)
+        const [model, packs, ready, modelNow] = this._modelGroup(window, info => show(info));
         page.add(model);
+        if (packs)
+            page.add(packs);
 
-        // languages: the main one first, then the others in the table's order
+        // languages of the chosen model: the main one first, then the others in the table's order
         const langs = new Adw.PreferencesGroup({title: 'Languages',
             description: 'Only the languages you turn on are recognised, so similar ones are not mixed up. ' +
-                'Changes apply from the next recording.'});
+                'Changes apply from the next recording.' +
+                (modelNow()?.small ? ' The list shows the languages of the chosen model.' : '')});
         const names = new Map(LANGUAGES.map(([c, en, own]) => [c, en === own ? en : `${en} (${own})`]));
-        const main = new Adw.ComboRow({title: 'Main Language',
-            subtitle: 'Preferred when Ukrainian, Russian and Bulgarian are hard to tell apart'});
+        let small = null;           // the helper's model info while the small model is chosen, else null
+        let codes = LARGE_CODES;    // the chosen model's languages
+        const enabled = () => sp.languages.filter(c => codes.has(c));
+        // [name, pack] of the language pack to download for a language no installed pack has (small model)
+        const missing = code => {
+            const all = Object.entries(small?.small.packs ?? {});
+            return all.some(([, p]) => p.installed && p.languages?.includes(code)) ? null
+                : all.find(([, p]) => p.languages?.includes(code)) ?? null;
+        };
+        const main = new Adw.ComboRow({title: 'Main Language'});
         const fillMain = () => {
-            main.model = Gtk.StringList.new(sp.languages.map(c => names.get(c)));
+            main.model = Gtk.StringList.new(enabled().map(c => names.get(c)));
             main.selected = 0;
         };
-        fillMain();
         main.connect('notify::selected', () => {
-            const c = sp.languages[main.selected];
+            const c = enabled()[main.selected];
             if (main.selected > 0 && c) {
                 sp.languages = [c, ...sp.languages.filter(x => x !== c)];
                 save();
@@ -265,16 +289,27 @@ export default class DictatorPrefs extends ExtensionPreferences {
         });
         langs.add(main);
         const list = new Adw.ExpanderRow({title: 'Enabled Languages'});
+        const switches = new Map();
         const summary = () => {
-            list.subtitle = sp.languages.map(c => names.get(c).split(' (')[0]).join(', ');
+            const on = enabled();
+            list.subtitle = on.length ? on.map(c => NAMES.get(c)).join(', ') : 'None, turn one on';
+            for (const [code, row] of switches) {
+                const pack = row.active && missing(code);
+                row.subtitle = pack ? esc(`Needs the language pack “${inWords(pack[1].languages)}” above`) : '';
+            }
         };
         for (const [code] of LANGUAGES) {
             const row = new Adw.SwitchRow({title: names.get(code), active: sp.languages.includes(code)});
             row.connect('notify::active', () => {
                 if (row.active && !sp.languages.includes(code)) {
                     sp.languages.push(code);
+                    const pack = missing(code);
+                    if (pack) {
+                        toast(window, `${NAMES.get(code)} needs the language pack ` +
+                            `“${inWords(pack[1].languages)}”: download it above`);
+                    }
                 } else if (!row.active && sp.languages.includes(code)) {
-                    if (sp.languages.length === 1) {        // at least one language stays on
+                    if (enabled().length === 1) {        // at least one language stays on
                         row.active = true;
                         return;
                     }
@@ -285,10 +320,21 @@ export default class DictatorPrefs extends ExtensionPreferences {
                 summary();
             });
             list.add_row(row);
+            switches.set(code, row);
         }
-        summary();
         langs.add(list);
         page.add(langs);
+        show = info => {
+            small = info?.small && current(info) === 'small' ? info : null;
+            codes = small ? smallCodes(small) : LARGE_CODES;
+            for (const [code, row] of switches)
+                row.visible = codes.has(code);
+            main.subtitle = small ? 'Preferred when similar languages are hard to tell apart'
+                : 'Preferred when Ukrainian, Russian and Bulgarian are hard to tell apart';
+            fillMain();
+            summary();
+        };
+        show(modelNow());
 
         // text
         const text = new Adw.PreferencesGroup({title: 'Text'});
@@ -383,14 +429,18 @@ export default class DictatorPrefs extends ExtensionPreferences {
         return [page, ready];
     }
 
-    // The model: one row per variant (use it / download / remove). Downloading and converting are done
-    // by the helper (dictate --download), which reports its progress line by line; closing the window
-    // stops it (the next download continues where it stopped). Returns [group, a model is installed].
-    _modelGroup(window) {
-        const group = new Adw.PreferencesGroup({title: 'Speech Model',
-            description: 'NVIDIA Parakeet TDT 0.6B v3 (CC BY 4.0), downloaded from Hugging Face. ' +
-                'It runs on this computer, without network access.'});
+    // The model: Small (tinyasr, with its language packs) or Large (Parakeet, one row per variant): use it,
+    // download, remove. Downloading (and converting) is done by the helper (dictate --download), which reports
+    // its progress line by line; closing the window stops it (the next download continues where it stopped).
+    // A helper without the small model gets the Large rows only, as before. onChange(info) runs after each
+    // refresh. Returns [group, the Language Packs group or null, a model is installed, () => model info].
+    _modelGroup(window, onChange) {
         let info = modelInfo();
+        const group = new Adw.PreferencesGroup({title: 'Speech Model', description: info?.small
+            ? 'It runs on this computer, without network access. Small: tinyasr (GPL-3.0-or-later), language ' +
+                'packs downloaded from GitHub. Large: NVIDIA Parakeet TDT 0.6B v3 (CC BY 4.0), downloaded from Hugging Face.'
+            : 'NVIDIA Parakeet TDT 0.6B v3 (CC BY 4.0), downloaded from Hugging Face. ' +
+                'It runs on this computer, without network access.'});
         if (!info) {
             const row = new Adw.ActionRow({title: 'The Speech Engine Is Not Installed',
                 subtitle: 'Dictation needs the Dictator helper program, installed separately'});
@@ -400,31 +450,41 @@ export default class DictatorPrefs extends ExtensionPreferences {
             // the command itself, to select and copy (the extension cannot install a program itself)
             group.add(new Adw.ActionRow({title: 'In a Terminal', subtitle_selectable: true,
                 subtitle: esc(`git clone ${REPO}.git\ncd dictator && ./install.sh --no-extension`)}));
-            return [group, false];
+            return [group, null, false, () => null];
         }
-        const toast = title => window.add_toast(new Adw.Toast({title: esc(title), timeout: 5}));
         let trial = null;           // the Try Dictation row, shown once a model is installed
-        const rows = new Map();
+        const rows = new Map();     // what --download takes ('int8', 'small', 'small:en-fa'...) -> its row
         let job = null;             // {id, proc, pulse, cancelled}
         let updating = false;
+        let large = null, packs = null;     // with the small model: the Large row, the Language Packs group
 
         const refresh = () => {
             info = modelInfo() ?? info;
+            const busy = !!job || !!info.busy;
             updating = true;
             for (const [id, u] of rows) {
-                const v = info.variants[id];
                 const running = job?.id === id;
-                u.radio.sensitive = v.installed;
-                u.radio.active = info.used === id;
-                u.download.visible = !v.installed && !running;
-                u.remove.visible = v.installed && !running;
-                u.download.sensitive = u.remove.sensitive = !job && !info.busy;
+                const installed = u.installed();
+                if (u.radio) {
+                    u.radio.sensitive = installed;
+                    u.radio.active = info.used === id;
+                }
+                u.download.visible = !installed && !running && (u.canDownload?.() ?? true);
+                u.remove.visible = installed && !running && !!u.ask;
+                u.download.sensitive = u.remove.sensitive = !busy;
                 u.bar.visible = u.cancel.visible = running;
                 if (!running)
-                    u.row.subtitle = v.installed ? `${info.used === id ? 'In use' : 'Installed'}, ${gb(v.disk)}` : u.note(v);
+                    u.row.subtitle = esc(u.text());
             }
             updating = false;
+            if (large) {
+                const v = VARIANTS.find(x => x.id === info.used);
+                large.subtitle = `NVIDIA Parakeet, ${LARGE_CODES.size} languages${v ? `. In use: ${v.title}` : ''}`;
+            }
+            if (packs)
+                packs.visible = current(info) === 'small' || !!info.small.installed || !!job?.id.startsWith('small');
             trial?.row.set_visible(!!info.used && !job);
+            onChange(info);
         };
 
         const stopJob = () => {
@@ -441,7 +501,7 @@ export default class DictatorPrefs extends ExtensionPreferences {
                 proc = Gio.Subprocess.new([HELPER, '--download', id],
                     Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE);
             } catch (e) {
-                toast(`Cannot start the download: ${e.message}`);
+                toast(window, `Cannot start the download: ${e.message}`);
                 return;
             }
             job = {id, proc, pulse: 0, cancelled: false};
@@ -462,9 +522,11 @@ export default class DictatorPrefs extends ExtensionPreferences {
                     error = line.slice(2);
                 } else if (kind === 'P' && stage === 'download') {
                     u.bar.fraction = Number(done) / Number(total);
-                    u.row.subtitle = `Downloading… ${gb(Number(done))} of ${gb(Number(total))}. Keep this window open`;
-                } else if (kind === 'P' && stage === 'convert' && done === '0' && !job.pulse) {
-                    u.row.subtitle = 'Converting to 8-bit on this computer…';
+                    u.row.subtitle = `Downloading… ${u.size(Number(done))} of ${u.size(Number(total))}. ` +
+                        'Keep this window open';
+                } else if (kind === 'P' && done === '0' && !job.pulse) {
+                    u.row.subtitle = stage === 'convert' ? 'Converting to 8-bit on this computer…'
+                        : 'Setting it up…';
                     job.pulse = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 150, () => {
                         u.bar.pulse();
                         return GLib.SOURCE_CONTINUE;
@@ -481,14 +543,14 @@ export default class DictatorPrefs extends ExtensionPreferences {
                 const cancelled = job.cancelled;
                 job = null;
                 if (!cancelled)
-                    toast(error ?? (p.get_successful() ? 'The speech model is ready' : 'The download failed'));
+                    toast(window, error ?? (p.get_successful() ? u.done : 'The download failed'));
                 refresh();
             });
         };
 
-        const remove = (id, title) => {
-            const dlg = new Adw.AlertDialog({heading: `Remove the ${title} Model?`,
-                body: `This frees ${gb(info.variants[id].disk)}. You can download it again later.`});
+        const remove = id => {
+            const [heading, body] = rows.get(id).ask();
+            const dlg = new Adw.AlertDialog({heading, body});
             dlg.add_response('cancel', 'Cancel');
             dlg.add_response('remove', 'Remove');
             dlg.set_response_appearance('remove', Adw.ResponseAppearance.DESTRUCTIVE);
@@ -498,44 +560,84 @@ export default class DictatorPrefs extends ExtensionPreferences {
                 try {
                     Gio.Subprocess.new([HELPER, '--remove', id], Gio.SubprocessFlags.STDERR_SILENCE).wait(null);
                 } catch (e) {
-                    toast(`Cannot remove it: ${e.message}`);
+                    toast(window, `Cannot remove it: ${e.message}`);
                 }
                 refresh();
             });
             dlg.present(window);
         };
 
+        // one row: a radio button to use it (spec.choose), Download, Remove (spec.ask), progress and Cancel;
+        // spec: {installed(), text(), size(bytes), done (the toast), ask() -> [heading, body], canDownload()}
         let first = null;
-        for (const v of VARIANTS) {
-            const row = new Adw.ActionRow({title: v.title});
-            const radio = new Gtk.CheckButton({valign: Gtk.Align.CENTER, group: first});
-            first ??= radio;
-            radio.connect('toggled', () => {
-                if (!updating && radio.active)
-                    writeSpeech({...readSpeech(), model: v.id});
-                if (!updating)
-                    refresh();
-            });
+        const addRow = (put, id, title, spec) => {
+            const row = new Adw.ActionRow({title: esc(title)});
+            let radio = null;
+            if (spec.choose) {
+                radio = new Gtk.CheckButton({valign: Gtk.Align.CENTER, group: first});
+                first ??= radio;
+                radio.connect('toggled', () => {
+                    if (!updating && radio.active)
+                        writeSpeech({...readSpeech(), model: id});
+                    if (!updating)
+                        refresh();
+                });
+                row.add_prefix(radio);
+                row.activatable_widget = radio;
+            }
             const dl = new Gtk.Button({label: 'Download', valign: Gtk.Align.CENTER});
-            dl.connect('clicked', () => download(v.id));
+            dl.connect('clicked', () => download(id));
             const rm = new Gtk.Button({icon_name: 'user-trash-symbolic', valign: Gtk.Align.CENTER,
                 tooltip_text: 'Remove', css_classes: ['flat']});
-            rm.connect('clicked', () => remove(v.id, v.title));
+            rm.connect('clicked', () => remove(id));
             const bar = new Gtk.ProgressBar({valign: Gtk.Align.CENTER, width_request: 120});
             const cancel = new Gtk.Button({label: 'Cancel', valign: Gtk.Align.CENTER});
             cancel.connect('clicked', () => {
                 job.cancelled = true;
                 job.proc.send_signal(15);       // SIGTERM: the helper stops its download or conversion
             });
-            row.add_prefix(radio);
             for (const w of [bar, cancel, dl, rm])
                 row.add_suffix(w);
-            row.activatable_widget = radio;
-            group.add(row);
-            rows.set(v.id, {row, radio, download: dl, remove: rm, bar, cancel, note: v.note});
+            put(row);
+            rows.set(id, {...spec, row, radio, download: dl, remove: rm, bar, cancel});
+        };
+
+        if (info.small) {
+            const packDisk = () => Object.values(info.small.packs ?? {}).reduce((n, p) => n + (p.disk ?? 0), 0);
+            addRow(row => group.add(row), 'small', 'Small', {choose: true, size: mb, done: 'The small model is ready',
+                installed: () => !!info.small.installed, canDownload: () => !!info.small.worker,
+                text: () => ['Recommended. Fast, a 30 to 33 MB download per language pack',
+                    !info.small.worker ? 'Its engine is not built on this computer yet: run ./install.sh again'
+                        : info.small.installed ? `${info.used === 'small' ? 'In use' : 'Installed'}, ${mb(packDisk())}`
+                            : null].filter(Boolean).join('\n')});
+            large = new Adw.ExpanderRow({title: 'Large', expanded: VARIANTS.some(v => v.id === current(info))});
+            group.add(large);
+        }
+        for (const v of VARIANTS) {
+            addRow(row => (large ? large.add_row(row) : group.add(row)), v.id, v.title, {choose: true, size: gb,
+                done: 'The speech model is ready', installed: () => info.variants[v.id].installed,
+                text: () => {
+                    const x = info.variants[v.id];
+                    return x.installed ? `${info.used === v.id ? 'In use' : 'Installed'}, ${gb(x.disk)}` : v.note(x);
+                },
+                ask: () => [`Remove the ${v.title} Model?`,
+                    `This frees ${gb(info.variants[v.id].disk)}. You can download it again later.`]});
         }
         trial = this._trialRow(window);
         group.add(trial.row);
+        if (info.small) {
+            packs = new Adw.PreferencesGroup({title: 'Language Packs',
+                description: 'For the small model: download the ones with your languages.'});
+            for (const name of Object.keys(info.small.packs ?? {})) {
+                const pack = () => info.small.packs?.[name] ?? {};
+                addRow(row => packs.add(row), `small:${name}`, inWords(pack().languages ?? [name]), {size: mb,
+                    done: 'The language pack is ready', installed: () => !!pack().installed,
+                    text: () => (pack().installed ? `Installed, ${mb(pack().disk)}`
+                        : `${mb(pack().download)} download, takes ${mb(pack().size)}`),
+                    ask: () => ['Remove This Language Pack?', `${inWords(pack().languages ?? [name])}. ` +
+                        `This frees ${mb(pack().disk)}. You can download it again later.`]});
+            }
+        }
         window.connect('close-request', () => {
             if (job) {
                 job.cancelled = true;
@@ -548,7 +650,7 @@ export default class DictatorPrefs extends ExtensionPreferences {
         refresh();
         if (info.busy)
             group.description += '\nA download is running in another window.';
-        return [group, !!info.used];
+        return [group, packs, !!info.used, () => info];
     }
 
     // A test dictation (dictate --try): the voice level while you speak, then the text, here and
