@@ -850,13 +850,20 @@ class Recognizer:
             self.ready = first.get("load_s")
             self.waited = time.monotonic() - t0
 
-    def request(self, raw, settings):
+    def request(self, raw, settings, ctx=0):
         """One piece of a recording (Streamer). Returns the worker's answer (parakeet.py, lang
-        "pieces"), checked: {"cands": {code: [text, score]}, "main": code, "asr_s": s, "note": str}."""
+        "pieces"), checked: {"cands": {code: [text, score]}, "main": code, "asr_s": s, "note": str}.
+        ctx: raw starts with this many bytes of the recording before the piece, context for the Small
+        model (parakeet.py does not take it: Large gets the piece alone)."""
         self._wait_ready(settings)
+        if self.variant != "small":
+            raw, ctx = raw[ctx:], 0
+        req = {"n": len(raw), "lang": "pieces", "langs": self.langs,
+               "gate_db": GATE_DB[settings["voice_gate"]]}
+        if ctx:
+            req["ctx"] = ctx
         try:
-            self.proc.stdin.write(json.dumps({"n": len(raw), "lang": "pieces", "langs": self.langs,
-                                              "gate_db": GATE_DB[settings["voice_gate"]]}).encode() + b"\n")
+            self.proc.stdin.write(json.dumps(req).encode() + b"\n")
             self.proc.stdin.write(raw)
             self.proc.stdin.flush()
         except (OSError, ValueError, AttributeError):    # closed meanwhile by close() (cancel)
@@ -904,6 +911,8 @@ class Streamer:
     drops whole phrases; ~5 s pieces give worse words (too little context); 10-25 s were best.
     Silence: pieces are trimmed to EDGE_S of silence at both ends, and a piece with almost no voice is
     not sent at all (from noise the model invents words, e.g. "Well yeah, I'm definitely").
+    The Small model also hears the CONTEXT_S before each piece, without writing it: started cold in the
+    middle of speech it can skip a piece's first words, often a whole sentence.
     Language: each piece comes back decoded in every candidate language (parakeet.py, lang "pieces");
     the language is chosen once, from the scores summed over the whole recording, because one short
     piece is too little to tell Ukrainian from Russian.
@@ -917,6 +926,7 @@ class Streamer:
     SIL_DB = 10.0                     # a frame is silence below the noise floor + this
     EDGE_S = 0.3
     MIN_VOICE_S = 0.25                # less voice than this in a piece: not sent
+    CONTEXT_S = 4.0                   # Small hears this much before a piece (else it can skip its start)
 
     def __init__(self, rec, settings=None):
         import queue
@@ -941,12 +951,12 @@ class Streamer:
             item = self.q.get()
             if item is None:
                 return
-            piece, raw = item
+            piece, raw, ctx = item
             if self.error or self.stopped:
                 continue
             for attempt in (1, 2):                 # the worker died: start a new one, try once more
                 try:
-                    piece[2] = self.rec.request(raw, self.settings)
+                    piece[2] = self.rec.request(raw, self.settings, ctx)
                     break
                 except Exception as e:             # Fail, or the worker was closed under us (cancel)
                     if attempt == 2 or self.stopped:
@@ -1011,7 +1021,8 @@ class Streamer:
         b0, b1 = s * self.FRAME, (end_byte if tail and e2 == e else e2 * self.FRAME)
         piece = [b0, b1, None]
         self.pieces.append(piece)
-        self.q.put((piece, bytes(self.buf[b0:b1])))
+        c0 = max(0, b0 - int(self.CONTEXT_S / 0.02) * self.FRAME)
+        self.q.put((piece, bytes(self.buf[c0:b1]), b0 - c0))
 
     # -- the end
     def finish(self, final):

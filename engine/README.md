@@ -24,6 +24,10 @@ changes on top:
   timed there yet.
 - **Quiet speech.** The original could drop whole sentences when the speaker was quiet, because the
   voice detector took them for silence. Ours evens out the volume first.
+- **Piece starts.** The helper sends a long dictation in pieces. Started cold in the middle of
+  speech, the model could skip the first words of a piece, often a whole sentence, so the end of a
+  dictation could go missing. Now it also hears the 4 seconds before each piece, without writing
+  them again. On three real dictations (2 minutes), the words lost this way went from 12 to 3.
 - **Scores.** Each text comes with a score, so the helper can choose between languages.
 
 Where the CPU code has run so far:

@@ -12,8 +12,10 @@
   Dictator, each turned-on language of a pack adds one more pass. On an AMD Zen 2 server (AVX2), the
   final build is 18 to 35 times faster than the original tinyasr. Packs come from tinyasr's GitHub at
   a fixed commit, each checked against its SHA-256 (`dictate --download small`). Small runs only in
-  bubblewrap (no network; it sees only /usr, read-only, its program and the packs). The Large model
-  (NVIDIA Parakeet, 25 languages) stays, unchanged.
+  bubblewrap (no network; it sees only /usr, read-only, its program and the packs). Each piece of a
+  long dictation goes to Small with the 4 seconds before it, heard but not written again: without
+  them it could skip a piece's first words, so the end of a dictation could go missing. The Large
+  model (NVIDIA Parakeet, 25 languages) stays, unchanged.
 - `install.sh` asks for Small or Large and for your languages (suggested: your system's language and
   English; `--yes` takes the suggestions). For Small it builds the program `dictate-tinyasr` on your
   computer: with Rust if you have it, else in a podman or docker image of Fedora's Rust
